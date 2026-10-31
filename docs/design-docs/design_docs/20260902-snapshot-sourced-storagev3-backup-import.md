@@ -1223,6 +1223,23 @@ duplicates its tail. A single `end_ts` cannot express the cut: a `FlushAll`
 broadcast appends one message per PChannel and each append takes its own
 time-tick, so every PChannel has its own boundary.
 
+The Add Secondary caller must quiesce source imports around snapshot creation.
+Before issuing the source `FlushAll`, it must wait until no import job is
+unfinished. It must then prevent new source imports until every collection
+snapshot in the backup has been created and its cut is fixed. Ordinary DML may
+continue, and the target's restore import is not a source import. Once a
+collection's snapshot cut is fixed, later source imports are outside its bundle
+and CDC can replay their complete jobs from the flush checkpoint.
+
+This precondition is part of the bounded-restore contract, not a server-side
+admission check. An import-produced segment can retain raw row timestamps from
+before the flush even when its Import or CommitImport message is after it. With
+`B < Import < CommitImport`, importing those rows and replaying the job would
+duplicate them. With `Import <= B < CommitImport`, CDC resumes after the Import
+and cannot reconstruct the job from the later CommitImport. The reader therefore
+keeps the raw row-range rule and never infers job replayability or silently drops
+a segment from `SourceCommitTimestamp`.
+
 `snapshot_pch_end_ts` is a snapshot-only JSON **string** mapping source PChannel
 to hybrid timestamp, e.g. `"{\"by-dev-rootcoord-dml_0\":\"4611686018427387904\"}"`.
 It is bounded to 64 KiB like `partition_mapping`. Keys must be PChannels;
@@ -1242,14 +1259,6 @@ key. A file whose PChannel the map does not name fails the job at expansion:
 importing it uncut is exactly the duplication the option exists to prevent, so
 silence is not an option. Bounds that leave a data segment's PChannel unnamed,
 or a data segment with no source channel, fail expansion as well.
-
-The PChannel bound also has a segment-level commit-time check. An import-produced
-segment can retain raw row timestamps before the flush while its captured
-`SourceCommitTimestamp` is after it. When that commit timestamp is nonzero and
-above the channel bound, the whole file contributes zero rows in both PreImport
-and Import; CDC replays the source Import instead. A zero or in-bound commit
-timestamp keeps the raw row-range rule above. This extra check belongs only to
-the replication bound and does not change ordinary `start_ts`/`end_ts` semantics.
 
 The bound is an **inclusive** upper bound, matching the secondary's
 `TimeTick <= checkpoint` deduplication: rows at exactly the bound are imported
